@@ -1,17 +1,106 @@
 import os
+from dotenv import load_dotenv
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict, Tuple
-from langchain.llms import Ollama
+import boto3
+from botocore.config import Config
+from langchain.llms import Bedrock
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 import re
+import xlsxwriter
 from coinstat.helpers import get_token_amount, update_holdings, save_user_data, load_user_data, handle_address, add_tokens, group_holdings, save_report_csv, plot_holdings
 from tokeninsight.helpers import load_coin_ratings, calculate_final_scores, display_final_scores, show_ratings
 
-# Initialize the Ollama LLM
-llm = Ollama(model="llama3.1")
+load_dotenv()
+
+## ONLY DEBUGGING______________________________________________________________________________________________________________________________
+def print_aws_credentials():
+    print(f"AWS_ACCESS_KEY_ID: {'*' * len(os.getenv('AWS_ACCESS_KEY_ID', ''))} (length: {len(os.getenv('AWS_ACCESS_KEY_ID', ''))})")
+    print(f"AWS_SECRET_ACCESS_KEY: {'*' * len(os.getenv('AWS_SECRET_ACCESS_KEY', ''))} (length: {len(os.getenv('AWS_SECRET_ACCESS_KEY', ''))})")
+    print(f"AWS_DEFAULT_REGION: {os.getenv('AWS_DEFAULT_REGION', 'Not set')}")
+
+print("Current AWS Credentials:")
+print_aws_credentials()
+
+# 2. Test AWS Credentials
+def test_aws_credentials():
+    try:
+        sts = boto3.client('sts')
+        response = sts.get_caller_identity()
+        print(f"AWS Credentials are valid. Account ID: {response['Account']}")
+        return True
+    except Exception as e:
+        print(f"AWS Credentials are invalid: {str(e)}")
+        return False
+
+print("\nTesting AWS Credentials:")
+test_aws_credentials()
+
+# 3. Check Bedrock Permissions
+def check_bedrock_permissions():
+    try:
+        bedrock = boto3.client('bedrock-runtime')
+        # List available models (adjust based on your region and available models)
+        response = bedrock.list_foundation_models()
+        print("Bedrock permissions are valid. Available models:")
+        for model in response['modelSummaries']:
+            print(f"- {model['modelId']}")
+        return True
+    except Exception as e:
+        print(f"Error accessing Bedrock: {str(e)}")
+        return False
+
+print("\nChecking Bedrock Permissions:")
+check_bedrock_permissions()
+
+# 4. Verify IAM Permissions
+print("\nVerify IAM Permissions:")
+print("Please check your IAM user or role permissions in the AWS Console.")
+print("Ensure you have the following permissions:")
+print("- bedrock:InvokeModel")
+print("- bedrock:ListFoundationModels")
+
+# 5. Region Check
+print(f"\nCurrent AWS Region: {os.getenv('AWS_DEFAULT_REGION', 'Not set')}")
+print("Ensure this region supports Amazon Bedrock and the model you're trying to use.")
+
+# 6. Temporary Solution: Use AWS CLI credentials
+print("\nIf issues persist, try using AWS CLI credentials:")
+print("1. Run 'aws configure' in your terminal")
+print("2. Enter your AWS Access Key ID and Secret Access Key")
+print("3. Set the default region to a region that supports Bedrock")
+print("4. Run your script again without using the .env file")
+##________________________________________________________________________________________________________________________________________________
+
+# Modified Bedrock client initialization
+def init_bedrock_client():
+    try:
+        return boto3.client('bedrock-runtime')
+    except Exception as e:
+        print(f"Failed to initialize Bedrock client: {e}")
+        return None
+    
+bedrock_client = boto3.client(
+    service_name='bedrock-runtime',
+    region_name='us-east-1',  
+    config=Config(
+        retries={'max_attempts': 10, 'mode': 'standard'}
+    )
+)
+
+# Initialize the Bedrock LLM
+llm = Bedrock(
+    client=bedrock_client,
+    model_id="meta.llama3-70b-instruct-v1:0",
+    model_kwargs={
+        # "max_tokens": 2000,
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }
+)
 
 def plot_radar_chart(overall_scores: Dict[str, float], username: str, diagram_dir: str) -> str:
     """
@@ -112,9 +201,11 @@ def save_final_report(overall_scores: Dict[str, float], holdings_df: pd.DataFram
     holdings_df['Counted in Rating'] = holdings_df['symbol'].isin(rated_symbols)
 
     with pd.ExcelWriter(file_path, engine='xlsxwriter') as writer:
+        # Write DataFrames to Excel
         metrics_df.to_excel(writer, sheet_name='Metrics', index=False)
         holdings_df.to_excel(writer, sheet_name='Holdings', index=False)
 
+        # Get workbook and worksheets
         workbook = writer.book
         metrics_sheet = writer.sheets['Metrics']
         holdings_sheet = writer.sheets['Holdings']
@@ -130,10 +221,23 @@ def save_final_report(overall_scores: Dict[str, float], holdings_df: pd.DataFram
             metrics_sheet.insert_image('F7', overall_scores['radar_plot_file'], {'x_scale': 0.5, 'y_scale': 0.5})
 
         # Auto-fit columns
-        for sheet in [metrics_sheet, holdings_sheet]:
-            for i, col in enumerate(sheet.get_worksheet().table):
-                max_length = max(len(str(cell.value)) for cell in col)
-                sheet.set_column(i, i, max_length + 2)
+        # For Metrics sheet
+        for i, col in enumerate(metrics_df.columns):
+            # Find the maximum length in the column
+            max_length = max(
+                metrics_df[col].astype(str).apply(len).max(),
+                len(col)
+            )
+            metrics_sheet.set_column(i, i, max_length + 2)
+
+        # For Holdings sheet
+        for i, col in enumerate(holdings_df.columns):
+            # Find the maximum length in the column
+            max_length = max(
+                holdings_df[col].astype(str).apply(len).max(),
+                len(col)
+            )
+            holdings_sheet.set_column(i, i, max_length + 2)
 
     print(f"Report saved to {file_path}")
 
@@ -468,6 +572,7 @@ analyze_allocation_chain = LLMChain(llm=llm, prompt=analyze_allocation_prompt)
 strategic_diversification_chain = LLMChain(llm=llm, prompt=strategic_diversification_prompt)
 outlier_analysis_chain = LLMChain(llm=llm, prompt=outlier_analysis_prompt)
 
+
 # Function from outlier.py
 def find_outliers_in_holdings(data_file, holdings):
     fundamental_columns = [
@@ -521,15 +626,39 @@ def analyze_outliers(outliers):
     return outlier_data
 
 def calculate_risk_allocations(holding_percentage_and_risk):
+    """
+    Calculate risk allocations from holdings data with improved error handling.
+    """
     risk_allocations = {'High': 0, 'Medium': 0, 'Low': 0}
     
     for holding in holding_percentage_and_risk:
-        parts = holding.split()
-        percentage = float(parts[1].rstrip('%'))
-        risk = parts[2].strip('()')
-        
-        risk_allocations[risk] += percentage
-    
+        try:
+            # Split the holding string and handle variations in format
+            parts = holding.split()
+            
+            # Extract symbol and percentage
+            symbol = parts[0]
+            percentage = float(parts[1].rstrip('%'))
+            
+            # Extract risk category - handle both (High) and High formats
+            risk = parts[2].strip('()').capitalize()
+            
+            # Map risk categories to standardized format
+            risk_mapping = {
+                'High': 'High',
+                'Moderate': 'Medium',
+                'Medium': 'Medium',
+                'Low': 'Low'
+            }
+            
+            standardized_risk = risk_mapping.get(risk, 'High')  # Default to High if unknown
+            risk_allocations[standardized_risk] += percentage
+            
+        except (IndexError, ValueError) as e:
+            print(f"Warning: Could not parse holding data: {holding}")
+            continue
+
+    # Format the allocations
     risk_formatted_portfolio_allocations = [
         f'High risk allocation: {risk_allocations["High"]:.2f}%',
         f'Medium risk allocation: {risk_allocations["Medium"]:.2f}%',
@@ -537,14 +666,14 @@ def calculate_risk_allocations(holding_percentage_and_risk):
     ]
     
     return risk_formatted_portfolio_allocations
-
+    
 def AI_analysis(user_name, portfolio_risk, client_holdings, holding_percentage_and_risk, included_percentage, missing_tokens, holdings_and_scores, df):
     # Get client name
     client_name = user_name
     
     # Run greeting chain
-    greeting_result = greeting_chain.run(client_name=client_name)
-    print(greeting_result)
+    greeting_result = greeting_chain.invoke({"client_name": client_name})
+    print(greeting_result['text'])
     
     # Conduct risk assessment
     print("\nPlease complete the following risk assessment questionnaire:")
@@ -586,26 +715,36 @@ def AI_analysis(user_name, portfolio_risk, client_holdings, holding_percentage_a
     print("\nAsset Allocation Analysis:")
     print(allocation_result)
 
-    risk_formatted_portfolio_allocations = calculate_risk_allocations(holding_percentage_and_risk)
+    try:
+        print("\nCalculating portfolio risk allocations...")
+        risk_formatted_portfolio_allocations = calculate_risk_allocations(holding_percentage_and_risk)
+        
+        print("\nRunning strategic diversification analysis...")
+        strategic_diversification_result = strategic_diversification_chain.run(
+            current_portfolio_composition=allocation_result,
+            overall_portfolio_risk=portfolio_risk,
+            target_risk=personal_risk_level,
+            adjustment=adjustment if adjustment else "None",
+            risk_formatted_portfolio_allocations=risk_formatted_portfolio_allocations
+        )
+        print("\nStrategic Diversification Suggestions:")
+        print(strategic_diversification_result)
 
-    strategic_diversification_result = strategic_diversification_chain.run(
-        current_portfolio_composition=allocation_result,
-        overall_portfolio_risk=port_risk,
-        target_risk=personal_risk_level,
-        adjustment=adjustment if adjustment else "None",
-        risk_formatted_portfolio_allocations=risk_formatted_portfolio_allocations
-    )
-    print("\nStrategic Diversification Suggestions:")
-    print(strategic_diversification_result)
-
-    print("Outlier Analysis:")
-    outlier_list = find_outliers_in_holdings(df, client_holdings)
-    final_outliers = analyze_outliers(outlier_list)
-    outlier_analysis_result = outlier_analysis_chain.run(
-        outliers=final_outliers,
-        holdings_and_scores=holdings_and_scores)
-
-    print(outlier_analysis_result)
+        print("\nAnalyzing outliers...")
+        outlier_list = find_outliers_in_holdings(df, client_holdings)
+        final_outliers = analyze_outliers(outlier_list)
+        outlier_analysis_result = outlier_analysis_chain.run(
+            outliers=final_outliers,
+            holdings_and_score=holdings_and_scores  
+        )
+        print("\nOutlier Analysis:")
+        print(outlier_analysis_result)
+        
+    except Exception as e:
+        print(f"\nError during analysis: {str(e)}")
+        print("Detailed error information:")
+        import traceback
+        traceback.print_exc()
 
 def main():
     # Define relative paths
@@ -725,7 +864,6 @@ def calculate_portfolio_risk(holdings_df):
     else:
         return "low"
 
-# Add error handling
 if __name__ == "__main__":
     try:
         main()
